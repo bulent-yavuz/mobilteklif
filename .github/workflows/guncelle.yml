@@ -1,0 +1,80 @@
+# Mobil Teklif - Malzeme listesini Google Drive'dan otomatik alir.
+# Her 15 dakikada bir Drive'daki Excel'i indirir, VERI_SIFRESI ile sifreler ve data.enc.json olarak kaydeder.
+# Gerekli gizli degerler (Settings > Secrets and variables > Actions):
+#   DOSYA_LINKI  : Google Drive paylasim baglantisi ("Baglantiya sahip herkes" goruntuleyebilir)
+#   VERI_SIFRESI : Telefondaki uygulamaya da girilecek sifre
+name: Malzeme listesini guncelle
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: guncelle
+  cancel-in-progress: false
+jobs:
+  guncelle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Excel okuyucuyu kur
+        run: npm install --no-save --no-audit --no-fund xlsx@0.18.5
+      - name: Listeyi indir ve sifrele
+        env:
+          DOSYA_LINKI: ${{ secrets.DOSYA_LINKI }}
+          VERI_SIFRESI: ${{ secrets.VERI_SIFRESI }}
+        run: |
+          cat > /tmp/guncelle.cjs <<'JS'
+          const fs = require("fs"), crypto = require("crypto"), XLSX = require(process.cwd() + "/node_modules/xlsx");
+          const link = (process.env.DOSYA_LINKI || "").trim(), pw = process.env.VERI_SIFRESI || "";
+          if (!link) { console.error("HATA: DOSYA_LINKI gizli degeri yok."); process.exit(1); }
+          if (!pw)   { console.error("HATA: VERI_SIFRESI gizli degeri yok."); process.exit(1); }
+          function candidates(u) {
+            const out = [], id = (u.match(/\/d\/([\w-]{20,})/) || u.match(/[?&]id=([\w-]{20,})/) || [])[1];
+            if (/docs\.google\.com\/spreadsheets/.test(u) && id) out.push(`https://docs.google.com/spreadsheets/d/${id}/export?format=xlsx`);
+            if (/drive\.google\.com/.test(u) && id) {
+              out.push(`https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t`);
+              out.push(`https://drive.google.com/uc?export=download&id=${id}`);
+            }
+            if (/sharepoint\.com/.test(u)) out.push(u + (u.includes("?") ? "&" : "?") + "download=1");
+            if (/1drv\.ms|onedrive\.live\.com/.test(u)) {
+              out.push("https://api.onedrive.com/v1.0/shares/u!" + Buffer.from(u).toString("base64").replace(/=+$/, "").replace(/\//g, "_").replace(/\+/g, "-") + "/root/content");
+              out.push(u + (u.includes("?") ? "&" : "?") + "download=1");
+            }
+            out.push(u);
+            return out;
+          }
+          (async () => {
+            let buf = null;
+            for (const u of candidates(link)) {
+              try {
+                const r = await fetch(u, { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0" } });
+                const b = Buffer.from(await r.arrayBuffer());
+                if (r.ok && b[0] === 0x50 && b[1] === 0x4b) { buf = b; console.log("Indirildi: " + new URL(u).host + " (" + b.length + " bayt)"); break; }
+                console.log("Olmadi: " + new URL(u).host + " HTTP " + r.status);
+              } catch (e) { console.log("Olmadi: " + e.message); }
+            }
+            if (!buf) { console.error("HATA: Dosya indirilemedi. Drive'da paylasimi 'Baglantiya sahip herkes' yapin ve DOSYA_LINKI'ni kontrol edin."); process.exit(1); }
+            const wb = XLSX.read(buf, { type: "buffer" });
+            const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: true, defval: null });
+            const json = JSON.stringify({ rows });
+            const hash = crypto.createHmac("sha256", pw).update(json).digest("hex").slice(0, 32);
+            let old = null; try { old = JSON.parse(fs.readFileSync("data.enc.json", "utf8")); } catch (e) {}
+            if (old && old.hash === hash) { console.log("Liste degismemis, kayit yok."); return; }
+            const salt = crypto.randomBytes(16), iv = crypto.randomBytes(12), iter = 200000;
+            const key = crypto.pbkdf2Sync(pw, salt, iter, 32, "sha256");
+            const c = crypto.createCipheriv("aes-256-gcm", key, iv);
+            const ct = Buffer.concat([c.update(json, "utf8"), c.final(), c.getAuthTag()]);
+            fs.writeFileSync("data.enc.json", JSON.stringify({ v: 1, updated: new Date().toISOString(), hash, iter,
+              salt: salt.toString("base64"), iv: iv.toString("base64"), ct: ct.toString("base64") }));
+            console.log("Liste guncellendi: " + (rows.length - 1) + " satir.");
+          })();
+          JS
+          node /tmp/guncelle.cjs
+      - name: Kaydet
+        run: |
+          git config user.name "mobilteklif-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data.enc.json 2>/dev/null || true
+          if git diff --cached --quiet; then echo "Degisiklik yok"; else git commit -m "Malzeme listesi guncellendi" && git push; fi
