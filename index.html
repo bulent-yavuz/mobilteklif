@@ -337,7 +337,7 @@ function setTop(title, sub, back){
   $("#topSub").textContent = sub;
   $("#backBtn").hidden = !back;
   $("#searchWrap").hidden = !(route.tab==="home");
-  $("#syncBtn").hidden = !(route.tab==="home" && meta.link);
+  $("#syncBtn").hidden = !(route.tab==="home" && settings.dataPass);
 }
 function render(){
   $("#top").style.removeProperty("--gc");
@@ -721,10 +721,12 @@ function viewSettings(){
       <label class="btn primary block" for="xfile" style="cursor:pointer">Excel dosyası seç (OneDrive / Dosyalar)</label>
       <input id="xfile" type="file" accept=".xlsx,.xls,.xlsm,.csv" hidden>
       <p class="note" style="margin:0">Telefonda dosya seçicide <b>OneDrive</b>'ı seçip MALZEMELER.xlsx'i açın. Sütunlar: MALZEME ADI, SATIŞ FİYATI, GRUP KODU (AMBAR DURUMU, ALIŞ FİYATI, BİRİM, STOK KODU ve diğer sütunlar varsa ürün detayında görünür).</p>
-      <div class="field"><label for="s_link">OneDrive paylaşım bağlantısı (isteğe bağlı)</label><input id="s_link" class="inp" type="url" placeholder="https://1drv.ms/x/…" value="${esc(meta.link||"")}"></div>
-      <button class="btn steel block" id="linkSync">Bağlantıdan güncelle</button>
-      ${SEED.length?`<button class="btn block" id="seedReset">Örnek listeye dön</button>`:""}
     </div>
+    <div class="card"><h2>Otomatik güncelleme</h2>
+      <p class="note" style="margin:0">OneDrive'daki Excel her 15 dakikada bir şifreli olarak alınır; uygulama her açılışta yeni listeyi kendisi yükler.<br>
+      Son liste: ${meta.dataUpdated?esc(new Date(meta.dataUpdated).toLocaleString("tr-TR")):"—"} · Son kontrol: ${meta.lastCheck?esc(new Date(meta.lastCheck).toLocaleString("tr-TR")):"—"}</p>
+      <div class="field"><label for="s_pass">Veri şifresi (GitHub'a girdiğiniz VERI_SIFRESI)</label><input id="s_pass" class="inp" type="password" data-set="dataPass" autocomplete="off"></div>
+      <button class="btn steel block" id="linkSync">Şimdi güncelle</button>
     <div class="card"><h2>Grup resimleri</h2>
       <p class="note" style="margin:0">Ana sayfadaki grup kartlarında görünür. Telefondan fotoğraf çekin ya da galeriden seçin.</p>
       <div>${groupList().map((g,i)=>`<div class="gset" style="--g:${GCOLORS[i%GCOLORS.length]}">
@@ -805,7 +807,9 @@ function importBuffer(buf, source){
   if (!window.XLSX) throw new Error("Excel okuyucu yüklenemedi. İnternet bağlantısını kontrol edin.");
   const wb = XLSX.read(buf, {type:"array"});
   const ws = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null});
+  return importRows(XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null}), source);
+}
+function importRows(rows, source){
   const list = parseSheet(rows);
   // sepetteki ürün kimliklerini isimle eşleştir
   const byName = new Map(list.map(p=>[tl(p.name), p]));
@@ -815,28 +819,51 @@ function importBuffer(buf, source){
   LS.set("products", products); LS.set("meta", meta); saveAll();
   return list.length;
 }
-function oneDriveUrl(link){
-  const u = link.trim();
-  if (/sharepoint\.com/i.test(u)) return u + (u.includes("?")?"&":"?") + "download=1";
-  if (/1drv\.ms|onedrive\.live\.com/i.test(u)){
-    const b64 = btoa(unescape(encodeURIComponent(u))).replace(/=+$/,"").replace(/\//g,"_").replace(/\+/g,"-");
-    return "https://api.onedrive.com/v1.0/shares/u!"+b64+"/root/content";
-  }
-  return u;
+/* ---------- Otomatik güncelleme: GitHub'daki şifreli liste ---------- */
+// GitHub Actions her 15 dk OneDrive'daki Excel'i indirip şifreleyerek data.enc.json olarak depoya yazar.
+function dataUrls(){
+  const urls = [];
+  const m = location.hostname.match(/^([^.]+)\.github\.io$/);
+  if (m){ const repo = location.pathname.split("/").filter(Boolean)[0];
+    if (repo) urls.push(`https://raw.githubusercontent.com/${m[1]}/${repo}/main/data.enc.json`); }
+  urls.push("data.enc.json");
+  return urls;
 }
-async function syncFromLink(){
-  const link = (meta.link||"").trim();
-  if (!link){ toast("Önce Ayarlar'a OneDrive bağlantısını girin"); return; }
-  toast("OneDrive'dan indiriliyor…", 6000);
+const b64d = s => Uint8Array.from(atob(s), c=>c.charCodeAt(0));
+async function decryptData(d, pw){
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey({name:"PBKDF2", salt:b64d(d.salt), iterations:d.iter||200000, hash:"SHA-256"}, base, {name:"AES-GCM", length:256}, false, ["decrypt"]);
+  const plain = await crypto.subtle.decrypt({name:"AES-GCM", iv:b64d(d.iv)}, key, b64d(d.ct));
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+let syncing = false;
+async function cloudSync(force){
+  if (syncing) return;
+  const pw = settings.dataPass || "";
+  if (!pw){ if (force){ toast("Önce Ayarlar'a veri şifresini girin", 4000); go("settings"); } return; }
+  if (!window.crypto || !crypto.subtle){ if (force) toast("Otomatik güncelleme için uygulamayı https adresinden açın", 4000); return; }
+  syncing = true;
   try{
-    const r = await fetch(oneDriveUrl(link));
-    if (!r.ok) throw new Error("HTTP "+r.status);
-    const n = importBuffer(new Uint8Array(await r.arrayBuffer()), "OneDrive bağlantısı");
-    render(); toast(n+" malzeme güncellendi");
-  }catch(e){
-    toast("Bağlantıdan alınamadı. Ayarlar → Excel dosyası seç ile OneDrive'dan seçin.", 5000);
-  }
+    let d = null;
+    for (const u of dataUrls()){
+      try{ const r = await fetch(u + "?t=" + Date.now(), {cache:"no-store"}); if (r.ok){ d = await r.json(); break; } }catch(e){}
+    }
+    meta.lastCheck = new Date().toISOString(); LS.set("meta", meta);
+    if (!d){ if (force) toast("Henüz otomatik liste yok. GitHub'daki güncelleme görevini çalıştırın.", 5000); if (route.tab==="settings") render(); return; }
+    if (!force && meta.dataHash === d.hash){ if (route.tab==="settings") render(); return; }
+    let payload;
+    try{ payload = await decryptData(d, pw); }
+    catch(e){ toast("Veri şifresi yanlış. Ayarlar'dan kontrol edin.", 5000); return; }
+    const n = importRows(payload.rows, "OneDrive · otomatik");
+    meta.dataHash = d.hash; meta.dataUpdated = d.updated; LS.set("meta", meta);
+    render(); toast("Liste güncellendi · " + n + " malzeme");
+  }catch(e){ if (force) toast("Güncelleme başarısız: " + (e.message||e), 5000); }
+  finally{ syncing = false; }
 }
+async function syncFromLink(){ toast("Kontrol ediliyor…", 2500); await cloudSync(true); }
+document.addEventListener("visibilitychange", ()=>{
+  if (document.visibilityState==="visible" && (!meta.lastCheck || Date.now()-new Date(meta.lastCheck).getTime() > 5*60*1000)) cloudSync(false);
+});
 
 /* ---------- Gezinme ---------- */
 function go(tab){ route = {tab, group:null}; query = ""; $("#q").value = ""; closeSheet(); render(); window.scrollTo(0,0); pushNav(); }
@@ -899,11 +926,11 @@ main.addEventListener("input", e=>{
   if (el.dataset.set){ const k = el.dataset.set;
     settings[k] = el.type==="checkbox" ? el.checked : (el.dataset.num ? (isNaN(num(el.value))?0:num(el.value)) : el.value);
     saveAll(); return; }
-  if (el.id==="s_link"){ meta.link = el.value.trim(); LS.set("meta", meta); }
 });
 main.addEventListener("change", async e=>{
   const el = e.target;
   if (el.dataset.qty!=null || el.dataset.price!=null){ render(); return; }
+  if (el.id==="s_pass"){ meta.dataHash = ""; LS.set("meta", meta); cloudSync(true); return; }
   if (el.dataset.set && el.type==="checkbox"){ settings[el.dataset.set] = el.checked; saveAll(); return; }
   if (el.id==="xfile" && el.files[0]){
     const f = el.files[0];
@@ -918,7 +945,7 @@ main.addEventListener("change", async e=>{
   }
 });
 main.addEventListener("click", e=>{
-  if (e.target.id==="linkSync"){ meta.link = ($("#s_link").value||"").trim(); LS.set("meta",meta); syncFromLink(); }
+  if (e.target.id==="linkSync"){ syncFromLink(); }
   if (e.target.id==="seedReset"){ products = seedProducts(); meta = {...meta, source:"Örnek veri · MALZEMELER.xlsx", updated:SEED_DATE, hasCost:false}; LS.set("products",null); LS.set("meta",meta); render(); toast("Örnek liste yüklendi"); }
   if (e.target.id==="logoDel"){ settings.logo=""; saveAll(); render(); }
 });
@@ -929,6 +956,7 @@ document.addEventListener("click", async e=>{
 });
 
 render();
+cloudSync(false);
 if ("serviceWorker" in navigator && STANDALONE && location.protocol==="https:") navigator.serviceWorker.register("sw.js").catch(()=>{});
 </script>
 
